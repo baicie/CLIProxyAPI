@@ -9,6 +9,10 @@ services:
     ports:
       # Loopback only: public traffic reaches the API through Caddy.
       - "127.0.0.1:${HOST_PORT:-8317}:8317"
+      # Same-host gateways (new-api) reach the API over their own docker bridge,
+      # so the hop stays off the public TLS path. 172.20.0.1 is new-api_default's
+      # gateway; override INTERNAL_BIND_IP if the peer network differs.
+      - "${INTERNAL_BIND_IP:-172.20.0.1}:${HOST_PORT:-8317}:8317"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
