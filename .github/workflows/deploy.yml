@@ -1,0 +1,338 @@
+name: Deploy
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      image_suffix:
+        description: "Optional suffix appended to the manually built image tag"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_PATH: baicie/cli-proxy-api
+  LOCAL_IMAGE: cli-proxy-api:deploy
+  CONTAINER_NAME: cli-proxy-api
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      version: ${{ steps.vars.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve build metadata
+        id: vars
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          IMAGE_SUFFIX: ${{ inputs.image_suffix }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_REGISTRY}/${IMAGE_PATH}"
+          if [ "${REF_TYPE}" = "tag" ]; then
+            version="${REF_NAME}"
+            latest_tag="${image}:latest"
+          else
+            version="manual-$(git rev-parse --short HEAD)"
+            suffix="${IMAGE_SUFFIX:-}"
+            if [ -n "${suffix}" ]; then
+              version="${version}-${suffix}"
+            fi
+            # Manual builds must never move the published latest tag.
+            latest_tag=""
+          fi
+          {
+            echo "version=${version}"
+            echo "image=${image}"
+            echo "latest_tag=${latest_tag}"
+            echo "tags<<TAGS_EOF"
+            printf '%s\n' "${image}:${version}"
+            if [ -n "${latest_tag}" ]; then
+              printf '%s\n' "${latest_tag}"
+            fi
+            echo "TAGS_EOF"
+            echo "commit=$(git rev-parse --short HEAD)"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          # latest is only part of the rendered tag list for v* tag pushes.
+          tags: ${{ steps.vars.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.vars.outputs.version }}
+            COMMIT=${{ steps.vars.outputs.commit }}
+            BUILD_DATE=${{ steps.vars.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify published manifests
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          LATEST_TAG: ${{ steps.vars.outputs.latest_tag }}
+        run: |
+          set -euo pipefail
+          for tag in "${VERSION}" latest; do
+            if [ "${tag}" = "latest" ] && [ -z "${LATEST_TAG}" ]; then
+              echo "skipping latest: it is only published for v* tag pushes"
+              continue
+            fi
+            echo "checking ${IMAGE}:${tag}"
+            docker buildx imagetools inspect "${IMAGE}:${tag}"
+          done
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      GHCR_USER: ${{ github.actor }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE: ${{ needs.build.outputs.image }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Install sshpass
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sshpass
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in SSH_HOST SSH_USER SSH_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::required secret ${name} is not set"
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::deployment secrets are incomplete; refusing to continue"
+            exit 1
+          fi
+
+      - name: Deploy over SSH
+        run: |
+          set -euo pipefail
+
+          port="${SSH_PORT:-22}"
+          image_path="${IMAGE#*/}"
+          remote="${SSH_USER}@${SSH_HOST}"
+
+          # Password travels through the environment, never through ssh argv.
+          export SSHPASS="${SSH_PASSWORD}"
+
+          ssh_opts=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p "${port}")
+
+          # Stage the token for the authenticated-pull fallback. It reaches the host
+          # over stdin, is only consumed when an anonymous pull is rejected, and is
+          # removed by the remote script's EXIT trap.
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            printf '%s' "${GHCR_TOKEN}" | sshpass -e ssh "${ssh_opts[@]}" "${remote}" \
+              "umask 077; cat > \$HOME/.cliproxy_ghcr_token"
+          fi
+
+          # Ship the compose file from this checkout so the repository copy stays the
+          # single source of truth. mkdir -p lets CI bootstrap a host that has no
+          # ~/cliproxy yet. This is a separate ssh call because stdin carries the file.
+          local_bytes=$(wc -c < deploy/docker-compose.deploy.yml | tr -d '[:space:]')
+          remote_bytes=$(sshpass -e ssh "${ssh_opts[@]}" "${remote}" \
+            'umask 077; mkdir -p "$HOME/cliproxy" && cat > "$HOME/cliproxy/docker-compose.deploy.yml" && wc -c < "$HOME/cliproxy/docker-compose.deploy.yml"' \
+            < deploy/docker-compose.deploy.yml | tr -d '[:space:]')
+          if [ "${remote_bytes:-0}" != "${local_bytes}" ]; then
+            echo "::error::compose upload was truncated (local ${local_bytes} bytes, remote ${remote_bytes:-0})"
+            exit 1
+          fi
+          echo "uploaded docker-compose.deploy.yml (${local_bytes} bytes)"
+
+          sshpass -e ssh "${ssh_opts[@]}" "${remote}" 'bash -s' -- "${image_path}" "${VERSION}" "${GHCR_USER}" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          IMAGE_PATH="${1:-}"
+          VERSION_ARG="${2:-}"
+          GHCR_USER_ARG="${3:-}"
+
+          if [ -z "${IMAGE_PATH}" ] || [ -z "${VERSION_ARG}" ]; then
+            echo "error: image path and version arguments are required" >&2
+            exit 64
+          fi
+
+          REMOTE_DIR="${HOME}/cliproxy"
+          TOKEN_FILE="${HOME}/.cliproxy_ghcr_token"
+          LOCAL_IMAGE="cli-proxy-api:deploy"
+          CONTAINER="cli-proxy-api"
+
+          cleanup() {
+            rm -f "${TOKEN_FILE}"
+          }
+          trap cleanup EXIT
+
+          if [ ! -d "${REMOTE_DIR}" ]; then
+            echo "error: ${REMOTE_DIR} does not exist on the target host" >&2
+            exit 65
+          fi
+
+          cd "${REMOTE_DIR}"
+
+          if [ ! -f "docker-compose.deploy.yml" ]; then
+            echo "error: docker-compose.deploy.yml is missing in ${REMOTE_DIR}" >&2
+            exit 66
+          fi
+
+          digest_for() {
+            ref="${1:-}"
+            digest=""
+            # buildx is the supported path on the target host.
+            if ! sudo -n docker buildx version > /dev/null 2>&1; then
+              echo "buildx is unavailable on the target host" >&2
+            elif buildx_out=$(sudo -n docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${ref}" 2>&1); then
+              digest=$(printf '%s' "${buildx_out}" | tr -d '[:space:]')
+              case "${digest}" in
+                sha256:*)
+                  printf '%s' "${digest}"
+                  return 0
+                  ;;
+                *)
+                  echo "buildx returned an unexpected digest for ${ref}: ${digest}" >&2
+                  ;;
+              esac
+            else
+              echo "buildx imagetools inspect failed for ${ref}: ${buildx_out}" >&2
+            fi
+            # The manifest API is not guaranteed to exist; this fallback is best effort.
+            if manifest=$(sudo -n docker manifest inspect "${ref}" 2>/dev/null); then
+              digest=$(printf '%s' "${manifest}" | grep -o 'sha256:[0-9a-f]\{64\}' | head -n 1 || true)
+              if [ -n "${digest}" ]; then
+                printf '%s' "${digest}"
+                return 0
+              fi
+            else
+              echo "docker manifest inspect fallback failed for ${ref}" >&2
+            fi
+            return 1
+          }
+
+          pulled_ref=""
+          pulled_digest=""
+          auth_denied=0
+
+          for registry in ghcr.nju.edu.cn ghcr.io; do
+            candidate="${registry}/${IMAGE_PATH}:${VERSION_ARG}"
+            echo "trying ${candidate}"
+            candidate_digest=$(digest_for "${candidate}") || {
+              echo "could not resolve a digest for ${candidate}: the buildx imagetools path failed and the manifest fallback is unavailable on this host"
+              continue
+            }
+            echo "resolved digest ${candidate_digest}"
+            if pull_output=$(sudo -n docker pull "${registry}/${IMAGE_PATH}@${candidate_digest}" 2>&1); then
+              pulled_ref="${registry}/${IMAGE_PATH}@${candidate_digest}"
+              pulled_digest="${candidate_digest}"
+              break
+            fi
+            echo "${pull_output}"
+            case "${pull_output}" in
+              *401*|*403*|*unauthorized*|*denied*)
+                auth_denied=1
+                ;;
+            esac
+          done
+
+          if [ -z "${pulled_ref}" ] && [ "${auth_denied}" -eq 1 ]; then
+            if [ -s "${TOKEN_FILE}" ]; then
+              echo "anonymous pull was rejected; retrying with a temporary token login"
+              if sudo -n docker login ghcr.io -u "${GHCR_USER_ARG}" --password-stdin < "${TOKEN_FILE}" > /dev/null 2>&1; then
+                for registry in ghcr.nju.edu.cn ghcr.io; do
+                  candidate="${registry}/${IMAGE_PATH}:${VERSION_ARG}"
+                  candidate_digest=$(digest_for "${candidate}") || continue
+                  if sudo -n docker pull "${registry}/${IMAGE_PATH}@${candidate_digest}"; then
+                    pulled_ref="${registry}/${IMAGE_PATH}@${candidate_digest}"
+                    pulled_digest="${candidate_digest}"
+                    break
+                  fi
+                done
+              else
+                echo "error: docker login to ghcr.io failed" >&2
+              fi
+              sudo -n docker logout ghcr.io > /dev/null 2>&1 || true
+              rm -f "${TOKEN_FILE}"
+            else
+              echo "error: pull requires authentication but no token is available" >&2
+            fi
+          fi
+
+          if [ -z "${pulled_ref}" ]; then
+            echo "error: could not pull ${IMAGE_PATH}:${VERSION_ARG} from any registry mirror" >&2
+            exit 67
+          fi
+
+          sudo -n docker tag "${pulled_ref}" "${LOCAL_IMAGE}"
+          echo "tagged ${LOCAL_IMAGE} from ${pulled_ref} (digest ${pulled_digest})"
+
+          if [ -f .env ] && grep -q '^CLI_PROXY_IMAGE=' .env; then
+            sed -i "s|^CLI_PROXY_IMAGE=.*|CLI_PROXY_IMAGE=${LOCAL_IMAGE}|" .env
+          else
+            printf 'CLI_PROXY_IMAGE=%s\n' "${LOCAL_IMAGE}" >> .env
+          fi
+
+          host_port=$(sed -n 's/^HOST_PORT=//p' .env 2>/dev/null | tail -n 1)
+          host_port="${host_port:-8317}"
+
+          sudo -n docker compose -f docker-compose.deploy.yml up -d --pull never
+
+          ready=0
+          for attempt in $(seq 1 30); do
+            running=$(sudo -n docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || echo false)
+            if [ "${running}" = "true" ] && curl -fsS -o /dev/null "http://127.0.0.1:${host_port}/healthz"; then
+              ready=1
+              break
+            fi
+            echo "waiting for ${CONTAINER} to become healthy (attempt ${attempt}/30)"
+            sleep 2
+          done
+
+          if [ "${ready}" -ne 1 ]; then
+            echo "error: health verification failed for ${CONTAINER}" >&2
+            sudo -n docker logs --tail 80 "${CONTAINER}" || true
+            exit 1
+          fi
+
+          echo "deployment healthy on 127.0.0.1:${host_port}"
+          REMOTE_SCRIPT

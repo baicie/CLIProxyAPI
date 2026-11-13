@@ -1,0 +1,25 @@
+# Minimal v8-layout configuration for the deploy stack.
+# Copy to ~/cliproxy/config.yaml and replace every <REPLACE_ME> value.
+# The management API rewrites this file, so it must stay writable.
+config-version: 8
+
+server:
+  # Empty binds all interfaces inside the container; the published port is loopback-only.
+  host: ""
+  port: 8317
+  trusted-proxies:
+    - "127.0.0.1"
+
+management:
+  # Public traffic is terminated by Caddy, so management must accept non-localhost clients.
+  allow-remote: true
+  secret-key: "<REPLACE_ME>"
+  disable-control-panel: false
+
+access:
+  # Inbound API keys accepted by this proxy.
+  api-keys:
+    - "<REPLACE_ME>"
+
+oauth:
+  auth-dir: "/root/.cli-proxy-api"
