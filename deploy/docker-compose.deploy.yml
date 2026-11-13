@@ -1,0 +1,26 @@
+# Production stack for the mirrored CLIProxyAPI image.
+# Published by .github/workflows/deploy.yml and deployed to the target host at ~/cliproxy/.
+# CLI_PROXY_IMAGE is normally rewritten to a locally tagged image by the deploy workflow.
+services:
+  cli-proxy-api:
+    image: ${CLI_PROXY_IMAGE:-ghcr.io/baicie/cli-proxy-api:latest}
+    container_name: cli-proxy-api
+    restart: unless-stopped
+    ports:
+      # Loopback only: public traffic reaches the API through Caddy.
+      - "127.0.0.1:${HOST_PORT:-8317}:8317"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # Writable on purpose: the management API rewrites configuration in place.
+      - ./config.yaml:/CLIProxyAPI/config.yaml
+      - ./auths:/root/.cli-proxy-api
+      - ./logs:/CLIProxyAPI/logs
+      # managementasset.StaticDir resolves to /CLIProxyAPI/static, so the control
+      # panel asset survives container replacement.
+      - ./data:/CLIProxyAPI/static
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
